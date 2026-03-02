@@ -6,7 +6,7 @@ compose-rl controller pattern:
 
     asyncio loop:
         1. generate rollouts  (vLLM rollout server)
-        2. send data to train servers  (/create_online_dataset)
+        2. send dataset location to train servers  (/create_online_dataset)
         3. trigger training  (/train_1_iter)
         4. sync weights  (NCCL in-memory, with disk fallback)
 
@@ -192,22 +192,24 @@ async def run(cfg: dict):
         t_generate = time.perf_counter()
         rollout_resp = await rollout_engine.generate(questions, answers)
         generate_time = time.perf_counter() - t_generate
-        rollout_batches = rollout_resp["rollout_batches"]
+        dataset_path = rollout_resp["dataset_path"]
         rollout_tps = float(rollout_resp["rollout_tokens_per_sec"])
         reward_mean = float(rollout_resp["reward_mean"])
         accuracy = float(rollout_resp["accuracy"])
+        num_samples = int(rollout_resp["num_samples"])
         log.info(
-            "Step %d: reward=%.3f acc=%.1f%% | rollout %.0f tok/s (generate %.2fs)",
+            "Step %d: reward=%.3f acc=%.1f%% | rollout %.0f tok/s, %d samples (generate %.2fs)",
             k,
             reward_mean,
             accuracy * 100,
             rollout_tps,
+            num_samples,
             generate_time,
         )
 
-        # 2) send to train servers  (all ranks receive the same data)
+        # 2) send dataset location to train servers.
         t_push = time.perf_counter()
-        await train_engine.create_online_dataset(rollout_batches)
+        await train_engine.create_online_dataset(dataset_path)
         push_time = time.perf_counter() - t_push
 
         # 3) train
@@ -224,6 +226,7 @@ async def run(cfg: dict):
                 "timing/generate_time_s": generate_time,
                 "timing/dataset_push_time_s": push_time,
                 "timing/train_rpc_time_s": train_time,
+                "rollout/num_samples": num_samples,
                 "train/loss": metrics["loss"],
                 "train/kl": metrics["kl"],
                 "train/grad_norm": metrics["grad_norm"],
@@ -236,6 +239,7 @@ async def run(cfg: dict):
                     "timing/generate_time_s": generate_time,
                     "timing/dataset_push_time_s": push_time,
                     "timing/train_rpc_time_s": train_time,
+                    "rollout/num_samples": num_samples,
                 },
                 step=k,
             )

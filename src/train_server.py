@@ -24,6 +24,7 @@ import torch.distributed as dist
 import uvicorn
 from fastapi import FastAPI, Request
 from safetensors.torch import save_file
+from streaming import StreamingDataset
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -48,6 +49,15 @@ def _gpu_peak_tflops(device: torch.device) -> float | None:
     if "a6000" in name: return 154.0
     if "4090"  in name: return 165.0
     return None
+
+
+def _is_remote_dataset_path(path: str, configured_remote_root: str | None) -> bool:
+    if "://" in path:
+        return True
+    if configured_remote_root is None:
+        return False
+    root = str(configured_remote_root).rstrip("/")
+    return path == root or path.startswith(root + "/")
 
 
 # ── FSDP helper ──────────────────────────────────────────────────────
@@ -84,6 +94,7 @@ class TrainServer:
         mcfg, tcfg = cfg["model"], cfg["training"]
         scfg = cfg.get("server", {})
         wcfg = scfg.get("weight_sync", {})
+        ocfg = scfg.get("online_dataset", {})
         self.rank = dist.get_rank()
         self.device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
         self.weight_sync_cfg = wcfg
@@ -93,6 +104,11 @@ class TrainServer:
         except (TypeError, ValueError):
             self.max_nccl_params = int(float(max_nccl_params))
         self.weight_sync_packed = bool(wcfg.get("packed", True))
+        self.online_dataset_cfg = ocfg
+        self.online_dataset_remote_root = ocfg.get("remote_root")
+        cache_root = str(ocfg.get("cache_root", "/tmp/streaming_cache"))
+        self.streaming_cache_root = Path(cache_root) / f"rank_{self.rank}"
+        self.streaming_cache_root.mkdir(parents=True, exist_ok=True)
 
         # policy model (trainable, FSDP2)
         model, self.tokenizer = load_model(
@@ -171,30 +187,72 @@ class TrainServer:
 
     # ── /create_online_dataset ───────────────────────────────────────
 
-    def create_online_dataset(self, rollout_batches: list[dict]):
+    def _iter_streaming_samples(self, dataset_path: str):
+        opts = self.online_dataset_cfg
+        ds_kwargs: dict = {
+            "batch_size": int(self.cfg["training"]["train_batch_size"]),
+            "shuffle": False,
+        }
+        for key, cast in (
+            ("predownload", int),
+            ("cache_limit", str),
+            ("download_timeout", float),
+            ("download_retry", int),
+            ("partition_algo", str),
+        ):
+            if key in opts and opts[key] is not None:
+                ds_kwargs[key] = cast(opts[key])
+
+        if _is_remote_dataset_path(dataset_path, self.online_dataset_remote_root):
+            local_cache = self.streaming_cache_root / Path(dataset_path.rstrip("/")).name
+            dataset = StreamingDataset(
+                remote=dataset_path,
+                local=str(local_cache),
+                **ds_kwargs,
+            )
+        else:
+            dataset = StreamingDataset(
+                remote=None,
+                local=dataset_path,
+                **ds_kwargs,
+            )
+        for sample in dataset:
+            yield sample
+
+    def create_online_dataset(
+        self,
+        dataset_path: str,
+    ):
         """Buffer rollout data for training.
 
         action_log_probs come directly from vLLM (computed at generation time
         under the same policy that produced the tokens), so we only need one
         forward pass here — the reference model for KL.
         """
+        records = self._iter_streaming_samples(dataset_path)
         self.replay.clear()
         with torch.no_grad():
-            for d in rollout_batches:
-                seq  = torch.tensor(d["sequences"],        dtype=torch.long,  device=self.device)
-                attn = torch.tensor(d["attention_mask"],   dtype=torch.bool,  device=self.device)
-                act  = torch.tensor(d["action_mask"],      dtype=torch.bool,  device=self.device)
-                lp   = torch.tensor(d["action_log_probs"], dtype=torch.float, device=self.device)
+            for d in records:
+                seq = torch.tensor(d["sequences"], dtype=torch.long, device=self.device)
+                attn = torch.tensor(d["attention_mask"], dtype=torch.bool, device=self.device)
+                act = torch.tensor(d["action_mask"], dtype=torch.bool, device=self.device)
+                lp = torch.tensor(d["action_log_probs"], dtype=torch.float, device=self.device)
                 ref_lp = sequences_log_probs(self.ref_model, seq, attn)
                 kl = approx_kl_divergence(lp, ref_lp, act)
-                self.replay.append(Experience(
-                    sequences=seq, action_log_probs=lp, ref_log_probs=ref_lp,
-                    returns=torch.tensor(d["returns"],    dtype=torch.float, device=self.device),
-                    advantages=torch.tensor(d["advantages"], dtype=torch.float, device=self.device),
-                    action_mask=act, attention_mask=attn, kl=kl,
-                ).to(torch.device("cpu")))
+                self.replay.append(
+                    Experience(
+                        sequences=seq,
+                        action_log_probs=lp,
+                        ref_log_probs=ref_lp,
+                        returns=torch.tensor(d["returns"], dtype=torch.float, device=self.device),
+                        advantages=torch.tensor(d["advantages"], dtype=torch.float, device=self.device),
+                        action_mask=act,
+                        attention_mask=attn,
+                        kl=kl,
+                    ).to(torch.device("cpu"))
+                )
         torch.cuda.empty_cache()
-        return {"status": "ok", "buffer_size": len(self.replay)}
+        return {"status": "ok", "buffer_size": len(self.replay), "dataset_path": dataset_path}
 
     # ── /train_1_iter ────────────────────────────────────────────────
 
@@ -318,7 +376,7 @@ server: TrainServer | None = None
 @app.post("/create_online_dataset")
 async def ep_create_dataset(request: Request):
     data = await request.json()
-    return server.create_online_dataset(data["rollout_batches"])
+    return server.create_online_dataset(data["dataset_path"])
 
 
 @app.post("/train_1_iter")

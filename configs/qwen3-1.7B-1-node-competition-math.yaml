@@ -54,6 +54,17 @@ parameters:
       transport_init:
         device_index: 0               # ibverbs: NIC index
         provider: ""                  # libfabric: e.g. verbs;ofi_rxm
+    online_dataset:
+      local_root: /dev/shm/rollout_mds
+      remote_root: /Volumes/main/streaming/xiaohan_zhang/test
+      num_streams: 4
+      size_limit: 64mb
+      compression: null
+      keep_local: true
+      max_keep_local_steps: 2
+      cache_root: /tmp/streaming_cache
+      predownload: 1024
+      partition_algo: relaxed
   
   training:
     seed: 42
@@ -85,4 +96,3 @@ parameters:
   wandb:
     project: RL
     run_name: grpo
-
