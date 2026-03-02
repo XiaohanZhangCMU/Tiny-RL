@@ -5,11 +5,16 @@ requires-python = ">=3.12, <3.14"
 dependencies = [
     "torch>=2.4",
     "transformers>=4.45",
+    "hf_transfer",
     "datasets>=3.0",
-    "vllm>=0.6",
+    "vllm>=0.16",
     "wandb>=0.18",
     "pyyaml>=6.0",
     "accelerate>=1.12.0",
+    "aiohttp>=3.9",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
