@@ -13,7 +13,6 @@ import torch
 import uvicorn
 from fastapi import FastAPI, Request
 
-from online_dataset import write_packed_rollout_dataset
 from utils import (
     load_config,
     load_model,
@@ -173,6 +172,9 @@ class RolloutServer:
                     "action_log_probs": vllm_lp.tolist(),
                 }
 
+        # Lazy import: keep streaming package out of startup path so vLLM CUDA
+        # worker bootstrap happens before any optional dataset stack side effects.
+        from online_dataset import write_packed_rollout_dataset
         dataset_info = write_packed_rollout_dataset(
             _iter_samples(),
             out_root=str(local_dir),

@@ -6,10 +6,6 @@ from queue import Queue
 from typing import Any
 from typing import Iterable
 
-from streaming import MDSWriter
-from streaming.base.util import merge_index
-
-
 PACKED_COLUMNS = {
     "sequences": "pkl",
     "returns": "pkl",
@@ -39,6 +35,8 @@ def _write_stream_partition(
     errors: list[Exception],
 ) -> None:
     try:
+        from streaming import MDSWriter
+
         subdir = Path(local_root) / f"stream_{sid:03d}"
         subdir.mkdir(parents=True, exist_ok=True)
         out_path: str | tuple[str, str] = str(subdir)
@@ -71,6 +69,8 @@ def write_packed_rollout_dataset(
     size_limit: int | str = "64mb",
     keep_local: bool = True,
 ) -> dict[str, Any]:
+    from streaming.base.util import merge_index
+
     keep_local = bool(keep_local or (remote_root is None))
     root = Path(out_root)
     root.mkdir(parents=True, exist_ok=True)

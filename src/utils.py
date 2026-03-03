@@ -15,6 +15,7 @@ from transformers import (
 from datasets import load_dataset
 
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 logging.getLogger("vllm").setLevel(logging.WARNING)
 
 import gc
