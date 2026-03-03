@@ -192,6 +192,7 @@ class TrainServer:
         ds_kwargs: dict = {
             "batch_size": int(self.cfg["training"]["train_batch_size"]),
             "shuffle": False,
+            "allow_unsafe_types": bool(opts.get("allow_unsafe_types", True)),
         }
         for key, cast in (
             ("predownload", int),
