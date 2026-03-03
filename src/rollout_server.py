@@ -116,13 +116,15 @@ class RolloutServer:
         )
         self.pad_id = self.tokenizer.eos_token_id
         ocfg = self.scfg.get("online_dataset", {})
-        self.online_dataset_local_root = str(ocfg.get("local_root", "/dev/shm/rollout_mds"))
+        local_root = ocfg.get("local_root", None)
+        self.online_dataset_local_root = str(local_root) if local_root else None
         self.online_dataset_remote_root = ocfg.get("remote_root")
         self.online_dataset_num_streams = int(ocfg.get("num_streams", 4))
         self.online_dataset_compression = ocfg.get("compression")
         self.online_dataset_size_limit = ocfg.get("size_limit", "64mb")
         self.online_dataset_keep_local = bool(ocfg.get("keep_local", True))
         self.online_dataset_max_keep = int(ocfg.get("max_keep_local_steps", 2))
+        self.online_dataset_run_id = str(ocfg.get("run_id", f"run_{int(time.time())}"))
         self._dataset_step = 0
         self._recent_dataset_dirs: list[str] = []
 
@@ -152,10 +154,15 @@ class RolloutServer:
         stats = {"generated_tokens": 0}
         step_id = self._dataset_step
         self._dataset_step += 1
-        local_dir = Path(self.online_dataset_local_root) / f"step_{step_id:08d}"
+        local_dir = None
+        if self.online_dataset_local_root:
+            local_dir = Path(self.online_dataset_local_root) / self.online_dataset_run_id / f"step_{step_id:08d}"
         remote_dir = None
         if self.online_dataset_remote_root:
-            remote_dir = _join_uri(self.online_dataset_remote_root, f"step_{step_id:08d}")
+            remote_dir = _join_uri(
+                _join_uri(self.online_dataset_remote_root, self.online_dataset_run_id),
+                f"step_{step_id:08d}",
+            )
 
         def _iter_samples():
             for seq_ids, returns, act_mask, vllm_lp, _completions in results:
@@ -177,14 +184,14 @@ class RolloutServer:
         from online_dataset import write_packed_rollout_dataset
         dataset_info = write_packed_rollout_dataset(
             _iter_samples(),
-            out_root=str(local_dir),
+            out_root=str(local_dir) if local_dir is not None else None,
             remote_root=remote_dir,
             num_streams=self.online_dataset_num_streams,
             compression=self.online_dataset_compression,
             size_limit=self.online_dataset_size_limit,
             keep_local=self.online_dataset_keep_local,
         )
-        if self.online_dataset_keep_local:
+        if self.online_dataset_keep_local and dataset_info["local_path"]:
             self._remember_dataset_dir(dataset_info["local_path"])
 
         reward_mean = sum(all_rewards) / max(len(all_rewards), 1)

@@ -25,7 +25,7 @@ def _join_uri(root: str, leaf: str) -> str:
 
 def _write_stream_partition(
     sid: int,
-    local_root: str,
+    local_root: str | None,
     remote_root: str | None,
     sample_queue: Queue,
     compression: str | None,
@@ -37,11 +37,17 @@ def _write_stream_partition(
     try:
         from streaming import MDSWriter
 
-        subdir = Path(local_root) / f"stream_{sid:03d}"
-        subdir.mkdir(parents=True, exist_ok=True)
-        out_path: str | tuple[str, str] = str(subdir)
-        if remote_root:
-            out_path = (str(subdir), _join_uri(remote_root, subdir.name))
+        stream_leaf = f"stream_{sid:03d}"
+        remote_subdir = _join_uri(remote_root, stream_leaf) if remote_root else None
+        local_subdir = str(Path(local_root) / stream_leaf) if local_root else None
+        if local_subdir:
+            Path(local_subdir).mkdir(parents=True, exist_ok=True)
+        if remote_subdir and local_subdir:
+            out_path: str | tuple[str | None, str] = (local_subdir, remote_subdir)
+        elif remote_subdir:
+            out_path = (None, remote_subdir)
+        else:
+            out_path = str(local_subdir)
         with MDSWriter(
             out=out_path,
             columns=PACKED_COLUMNS,
@@ -62,7 +68,7 @@ def _write_stream_partition(
 
 def write_packed_rollout_dataset(
     samples: Iterable[dict[str, Any]],
-    out_root: str,
+    out_root: str | None,
     remote_root: str | None = None,
     num_streams: int = 4,
     compression: str | None = None,
@@ -71,9 +77,15 @@ def write_packed_rollout_dataset(
 ) -> dict[str, Any]:
     from streaming.base.util import merge_index
 
+    if out_root is None and remote_root is None:
+        raise ValueError("one of out_root or remote_root must be set")
     keep_local = bool(keep_local or (remote_root is None))
-    root = Path(out_root)
-    root.mkdir(parents=True, exist_ok=True)
+    if out_root is None:
+        keep_local = False
+    root: Path | None = None
+    if out_root is not None:
+        root = Path(out_root)
+        root.mkdir(parents=True, exist_ok=True)
 
     stream_count = max(1, int(num_streams))
     queues = [Queue() for _ in range(stream_count)]
@@ -85,7 +97,7 @@ def write_packed_rollout_dataset(
             target=_write_stream_partition,
             args=(
                 sid,
-                str(root),
+                str(root) if root is not None else None,
                 remote_root,
                 queues[sid],
                 compression,
@@ -115,19 +127,28 @@ def write_packed_rollout_dataset(
         raise ValueError("cannot write streaming dataset: no rollout samples")
 
     # Merge stream_* indexes into root/index.json that trainers can open directly.
-    merge_out: str | tuple[str, str] = str(root)
-    if remote_root:
-        merge_out = (str(root), remote_root)
+    if root is not None and remote_root:
+        merge_out: str | tuple[str | None, str] = (str(root), remote_root)
+    elif remote_root:
+        merge_out = (None, remote_root)
+    else:
+        merge_out = str(root)
     merge_index(merge_out, keep_local=keep_local)
-    index_file = root / "index.json"
-    if keep_local and not index_file.is_file():
-        raise RuntimeError(f"failed to merge streaming index at {index_file}")
+    index_file: str
+    if remote_root:
+        index_file = _join_uri(remote_root, "index.json")
+    else:
+        assert root is not None
+        local_index = root / "index.json"
+        if not local_index.is_file():
+            raise RuntimeError(f"failed to merge streaming index at {local_index}")
+        index_file = str(local_index)
     dataset_path = remote_root or str(root)
 
     return {
         "dataset_path": dataset_path,
-        "local_path": str(root),
+        "local_path": str(root) if root is not None else None,
         "num_samples": written,
         "num_streams": stream_count,
-        "index_file": _join_uri(dataset_path, "index.json"),
+        "index_file": index_file,
     }
