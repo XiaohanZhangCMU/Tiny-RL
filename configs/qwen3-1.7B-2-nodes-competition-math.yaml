@@ -71,6 +71,7 @@ parameters:
       cache_root: /tmp/streaming_cache
       predownload: 1024
       partition_algo: relaxed
+      allow_unsafe_types: true
   
   training:
     seed: 42
