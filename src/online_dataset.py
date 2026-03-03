@@ -39,15 +39,18 @@ def _write_stream_partition(
 
         stream_leaf = f"stream_{sid:03d}"
         remote_subdir = _join_uri(remote_root, stream_leaf) if remote_root else None
-        local_subdir = str(Path(local_root) / stream_leaf) if local_root else None
-        if local_subdir:
-            Path(local_subdir).mkdir(parents=True, exist_ok=True)
-        if remote_subdir and local_subdir:
-            out_path: str | tuple[str | None, str] = (local_subdir, remote_subdir)
-        elif remote_subdir:
-            out_path = (None, remote_subdir)
-        else:
-            out_path = str(local_subdir)
+        #local_subdir = str(Path(local_root) / stream_leaf) if local_root else None
+        #if local_subdir:
+        #    Path(local_subdir).mkdir(parents=True, exist_ok=True)
+        #if remote_subdir and local_subdir:
+        #    out_path: str | tuple[str | None, str] = (local_subdir, remote_subdir)
+        #elif remote_subdir:
+        #    out_path = (None, remote_subdir)
+        #else:
+        #    out_path = str(local_subdir)
+
+        out_path = remote_subdir
+
         with MDSWriter(
             out=out_path,
             columns=PACKED_COLUMNS,
