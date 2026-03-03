@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -24,7 +25,7 @@ import torch.distributed as dist
 import uvicorn
 from fastapi import FastAPI, Request
 from safetensors.torch import save_file
-from streaming import StreamingDataset
+from streaming import Stream, StreamingDataset
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -187,7 +188,7 @@ class TrainServer:
 
     # ── /create_online_dataset ───────────────────────────────────────
 
-    def _iter_streaming_samples(self, dataset_path: str):
+    def _iter_streaming_samples(self, dataset_streams: list[str]):
         opts = self.online_dataset_cfg
         ds_kwargs: dict = {
             "batch_size": int(self.cfg["training"]["train_batch_size"]),
@@ -204,25 +205,21 @@ class TrainServer:
             if key in opts and opts[key] is not None:
                 ds_kwargs[key] = cast(opts[key])
 
-        if _is_remote_dataset_path(dataset_path, self.online_dataset_remote_root):
-            local_cache = self.streaming_cache_root / Path(dataset_path.rstrip("/")).name
-            dataset = StreamingDataset(
-                remote=dataset_path,
-                local=str(local_cache),
-                **ds_kwargs,
-            )
-        else:
-            dataset = StreamingDataset(
-                remote=None,
-                local=dataset_path,
-                **ds_kwargs,
-            )
+        streams: list[Stream] = []
+        for stream_path in dataset_streams:
+            if _is_remote_dataset_path(stream_path, self.online_dataset_remote_root):
+                digest = hashlib.sha1(stream_path.encode("utf-8")).hexdigest()[:16]
+                local_cache = self.streaming_cache_root / f"stream_{digest}"
+                streams.append(Stream(remote=stream_path, local=str(local_cache)))
+            else:
+                streams.append(Stream(remote=None, local=stream_path))
+        dataset = StreamingDataset(streams=streams, **ds_kwargs)
         for sample in dataset:
             yield sample
 
     def create_online_dataset(
         self,
-        dataset_path: str,
+        dataset_streams: list[str],
     ):
         """Buffer rollout data for training.
 
@@ -230,7 +227,7 @@ class TrainServer:
         under the same policy that produced the tokens), so we only need one
         forward pass here — the reference model for KL.
         """
-        records = self._iter_streaming_samples(dataset_path)
+        records = self._iter_streaming_samples(dataset_streams)
         self.replay.clear()
         with torch.no_grad():
             for d in records:
@@ -253,7 +250,11 @@ class TrainServer:
                     ).to(torch.device("cpu"))
                 )
         torch.cuda.empty_cache()
-        return {"status": "ok", "buffer_size": len(self.replay), "dataset_path": dataset_path}
+        return {
+            "status": "ok",
+            "buffer_size": len(self.replay),
+            "num_streams": len(dataset_streams),
+        }
 
     # ── /train_1_iter ────────────────────────────────────────────────
 
@@ -377,7 +378,7 @@ server: TrainServer | None = None
 @app.post("/create_online_dataset")
 async def ep_create_dataset(request: Request):
     data = await request.json()
-    return server.create_online_dataset(data["dataset_path"])
+    return server.create_online_dataset(data["dataset_streams"])
 
 
 @app.post("/train_1_iter")

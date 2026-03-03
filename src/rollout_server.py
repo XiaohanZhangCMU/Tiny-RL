@@ -200,7 +200,7 @@ class RolloutServer:
         return {
             "status": "ok",
             "dataset_path": dataset_info["dataset_path"],
-            "dataset_index": dataset_info["index_file"],
+            "dataset_streams": dataset_info["dataset_streams"],
             "num_samples": dataset_info["num_samples"],
             "num_streams": dataset_info["num_streams"],
             "reward_mean": reward_mean,

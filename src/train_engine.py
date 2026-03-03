@@ -50,10 +50,10 @@ class TrainEngine:
 
     # ── collective endpoints (must hit every rank) ───────────────────
 
-    async def create_online_dataset(self, dataset_path: str):
+    async def create_online_dataset(self, dataset_streams: list[str]):
         return await self._post_all(
             "/create_online_dataset",
-            json={"dataset_path": dataset_path},
+            json={"dataset_streams": dataset_streams},
         )
 
     async def train_1_iter(self) -> list[dict]:

@@ -75,8 +75,6 @@ def write_packed_rollout_dataset(
     size_limit: int | str = "64mb",
     keep_local: bool = True,
 ) -> dict[str, Any]:
-    from streaming.base.util import merge_index
-
     if out_root is None and remote_root is None:
         raise ValueError("one of out_root or remote_root must be set")
 
@@ -129,21 +127,11 @@ def write_packed_rollout_dataset(
     written = sum(counters)
     if written <= 0:
         raise ValueError("cannot write streaming dataset: no rollout samples")
-
-    merge_out: str | tuple[str, str] = str(root)
-    if remote_root:
-        merge_out = (str(root), remote_root)
-    merge_index(merge_out, keep_local=keep_local)
-
-    if remote_root:
-        index_file = _join_uri(remote_root, "index.json")
-        dataset_path = remote_root
-    else:
-        local_index = root / "index.json"
-        if not local_index.is_file():
-            raise RuntimeError(f"failed to merge streaming index at {local_index}")
-        index_file = str(local_index)
-        dataset_path = str(root)
+    stream_paths = [
+        _join_uri(remote_root, f"stream_{sid:03d}") if remote_root else str(root / f"stream_{sid:03d}")
+        for sid in range(stream_count)
+    ]
+    dataset_path = remote_root or str(root)
 
     local_path: str | None = str(root)
     if use_temp_local and not keep_local:
@@ -152,8 +140,8 @@ def write_packed_rollout_dataset(
 
     return {
         "dataset_path": dataset_path,
+        "dataset_streams": stream_paths,
         "local_path": local_path,
         "num_samples": written,
         "num_streams": stream_count,
-        "index_file": index_file,
     }

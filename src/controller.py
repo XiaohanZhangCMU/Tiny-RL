@@ -192,7 +192,7 @@ async def run(cfg: dict):
         t_generate = time.perf_counter()
         rollout_resp = await rollout_engine.generate(questions, answers)
         generate_time = time.perf_counter() - t_generate
-        dataset_path = rollout_resp["dataset_path"]
+        dataset_streams = rollout_resp["dataset_streams"]
         rollout_tps = float(rollout_resp["rollout_tokens_per_sec"])
         reward_mean = float(rollout_resp["reward_mean"])
         accuracy = float(rollout_resp["accuracy"])
@@ -207,9 +207,9 @@ async def run(cfg: dict):
             generate_time,
         )
 
-        # 2) send dataset location to train servers.
+        # 2) send stream locations to train servers.
         t_push = time.perf_counter()
-        await train_engine.create_online_dataset(dataset_path)
+        await train_engine.create_online_dataset(dataset_streams)
         push_time = time.perf_counter() - t_push
 
         # 3) train
