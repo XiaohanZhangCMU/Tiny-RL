@@ -108,7 +108,8 @@ class TrainServer:
         self.online_dataset_cfg = ocfg
         self.online_dataset_remote_root = ocfg.get("remote_root")
         cache_root = str(ocfg.get("cache_root", "/tmp/streaming_cache"))
-        self.streaming_cache_root = Path(cache_root) / f"rank_{self.rank}"
+        node_rank = os.environ.get("NODE_RANK", "0")
+        self.streaming_cache_root = Path(cache_root) / f"node_{node_rank}"
         self.streaming_cache_root.mkdir(parents=True, exist_ok=True)
 
         # policy model (trainable, FSDP2)
