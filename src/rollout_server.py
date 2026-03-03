@@ -99,6 +99,9 @@ class RolloutServer:
         self.num_infer_gpus = len(cfg.get("gpu_split", {}).get("inference", [0]))
         self.transport = build_transport(self.wcfg.get("transport", "mock"))
         self.last_synced_step = -1
+        # CPU pinned staging buffers for RDMA weight transfer (allocated on init_weight_sync).
+        # Maps param name -> (pinned_cpu_tensor, gpu_param_tensor).
+        self._rdma_pinned: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         _, self.tokenizer = load_model(
             self.mcfg["name"],
@@ -229,7 +232,26 @@ class RolloutServer:
                 merged.setdefault("listen_host", "0.0.0.0")
                 merged.setdefault("listen_port", master_port)
             merged.setdefault("tcp_timeout_s", 300)
-            return self.transport.init_endpoint(**merged)
+            result = self.transport.init_endpoint(**merged)
+            if result.get("status") == "ok":
+                # Allocate CPU-pinned staging buffers for each GPU parameter.
+                # ibv_reg_mr works on pinned host memory without requiring GPUDirect RDMA.
+                # The RDMA write destination will be these CPU buffers; apply_rdma_routes
+                # copies them back to GPU.
+                self._rdma_pinned = {}
+                model = _resolve_engine_model(self.engine)
+                if model is not None:
+                    for name, p in model.named_parameters():
+                        if p.is_cuda:
+                            pinned = torch.empty(p.numel(), dtype=p.dtype).pin_memory()
+                            self._rdma_pinned[name] = (pinned, p)
+                    log.info("RDMA: allocated %d CPU-pinned staging buffers (total %.1f MB)",
+                             len(self._rdma_pinned),
+                             sum(t.numel() * t.element_size() for t, _ in self._rdma_pinned.values()) / (1024 * 1024))
+                else:
+                    log.warning("RDMA: _resolve_engine_model returned None – "
+                                "no pinned buffers allocated, weight sync will have 0 routes")
+            return result
 
         return {"status": "ok", "mode": "disk"}
 
@@ -251,22 +273,57 @@ class RolloutServer:
         return {"status": "ok", "mode": "disk", "model_path": model_path}
 
     def get_param_metadata(self) -> dict[str, Any]:
-        data = [{"rank": 0, "params": _collect_param_metadata_local(self.engine)}]
-        return {"status": "ok", "workers": data}
+        if self._rdma_pinned:
+            # Return CPU-pinned buffer addresses as the RDMA write destination ptrs.
+            params = [
+                {
+                    "name": name,
+                    "ptr": int(pinned.data_ptr()),
+                    "nbytes": int(pinned.numel() * pinned.element_size()),
+                    "dtype": str(pinned.dtype).replace("torch.", ""),
+                    "shape": list(gpu_p.shape),
+                }
+                for name, (pinned, gpu_p) in self._rdma_pinned.items()
+            ]
+        else:
+            params = _collect_param_metadata_local(self.engine)
+        data = [{"rank": 0, "params": params}]
+        log.info("Rollout param metadata: %d tensors (rdma_pinned=%s)", len(params), bool(self._rdma_pinned))
+        return {"status": "ok", "workers": data, "num_params": len(params)}
 
     def get_memory_regions(self) -> dict[str, Any]:
-        data = [{"rank": 0, "regions": _collect_memory_regions_local()}]
-        return {"status": "ok", "workers": data}
+        if self._rdma_pinned:
+            # One region per pinned buffer – ibv_reg_mr works on pinned host memory
+            # without GPUDirect RDMA (unlike CUDA device memory).
+            regions = [
+                {"ptr": int(pinned.data_ptr()), "size": int(pinned.numel() * pinned.element_size())}
+                for pinned, _ in self._rdma_pinned.values()
+            ]
+        else:
+            regions = _collect_memory_regions_local()
+        data = [{"rank": 0, "regions": regions}]
+        log.info("Rollout memory regions: %d (rdma_pinned=%s)", len(regions), bool(self._rdma_pinned))
+        return {"status": "ok", "workers": data, "num_regions": len(regions)}
 
     def register_mrs(self, regions: list[dict[str, Any]]) -> dict[str, Any]:
         mrs = self.transport.register_memory_regions(regions)
-        return {"status": "ok", "mrs": mrs}
+        log.info("Rollout MR registration: requested=%d registered=%d", len(regions), len(mrs))
+        return {"status": "ok", "mrs": mrs, "num_mrs": len(mrs)}
 
     def apply_rdma_routes(self, routes: list[dict[str, Any]], step: int) -> dict[str, Any]:
         total_bytes = sum(int(r.get("nbytes", 0)) for r in routes)
         self.last_synced_step = max(self.last_synced_step, int(step))
-        log.info("RDMA weight sync step %d: %d routes, %.1f MB",
-                 step, len(routes), total_bytes / (1024 * 1024))
+        # Copy updated weights from CPU-pinned staging buffers back to GPU params.
+        n_copied = 0
+        if self._rdma_pinned and routes:
+            for name, (pinned, gpu_p) in self._rdma_pinned.items():
+                try:
+                    gpu_p.data.copy_(pinned.view(gpu_p.shape))
+                    n_copied += 1
+                except Exception as exc:
+                    log.warning("RDMA copy CPU->GPU failed for %s: %s", name, exc)
+        log.info("RDMA weight sync step %d: %d routes, %.1f MB, %d params CPU->GPU",
+                 step, len(routes), total_bytes / (1024 * 1024), n_copied)
         return {
             "status": "ok",
             "mode": "rdma",

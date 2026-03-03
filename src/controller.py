@@ -158,24 +158,45 @@ async def run(cfg: dict):
                     sync_mode = train_prep[0].get("mode", "disk")
                     sync_reason = train_prep[0].get("reason", "rdma_prepare_failed")
                 else:
+                    trainer_routes = train_prep[0].get("routes", [])
+                    num_rollout_params = sum(
+                        len(worker.get("params", [])) for worker in rollout_meta.get("workers", [])
+                    )
+                    num_rollout_regions = sum(
+                        len(worker.get("regions", [])) for worker in rollout_regions.get("workers", [])
+                    )
                     mrs = []
                     for worker in rollout_regions.get("workers", []):
                         reg = await rollout_engine.register_mrs(worker.get("regions", []))
+                        if reg.get("status") != "ok":
+                            raise RuntimeError(f"rollout register_mrs failed: {reg}")
                         mrs.extend(reg.get("mrs", []))
+                    log.info(
+                        "RDMA init stats: trainer routes=%d, rollout params=%d, rollout regions=%d, registered MRs=%d",
+                        len(trainer_routes),
+                        num_rollout_params,
+                        num_rollout_regions,
+                        len(mrs),
+                    )
+                    if num_rollout_params == 0:
+                        raise RuntimeError("rollout_param_metadata_empty")
+                    if len(mrs) == 0:
+                        raise RuntimeError("rollout_memory_regions_or_mr_registration_empty")
                     rdma_routes = build_qwen_routing_table(
-                        trainer_routes=train_prep[0].get("routes", []),
+                        trainer_routes=trainer_routes,
                         rollout_meta=rollout_meta,
                         rollout_mrs=mrs,
                     )
+                    if len(rdma_routes) == 0:
+                        raise RuntimeError("rdma_routes_empty_after_qwen_match")
                     log.info(
                         "Prepared RDMA routes: %d entries, %d remote MRs",
                         len(rdma_routes),
                         len(mrs),
                     )
         except Exception as exc:
-            sync_mode = "disk"
             sync_reason = f"rdma_init_failed: {exc}"
-            log.warning("Weight sync fallback to disk: %s", sync_reason)
+            raise RuntimeError(sync_reason) from exc
 
     log.info("Weight sync mode: %s (%s)", sync_mode, sync_reason)
 
@@ -274,18 +295,16 @@ async def run(cfg: dict):
                     )
                     if rollout_ack.get("status") != "ok" or train_ack[0].get("status") != "ok":
                         raise RuntimeError(f"rdma sync failed: rollout={rollout_ack} train={train_ack}")
-                    if train_ack[0].get("fallback") == "disk":
-                        await rollout_engine.reload_from_disk(weights_dir)
+                    if int(rollout_ack.get("num_routes", 0)) <= 0 or int(rollout_ack.get("total_bytes", 0)) <= 0:
+                        raise RuntimeError(f"rdma_no_bytes_received: {rollout_ack}")
+                    train_transport = train_ack[0].get("transport", {})
+                    if int(train_transport.get("num_ops", 0)) <= 0 or int(train_transport.get("total_bytes", 0)) <= 0:
+                        raise RuntimeError(f"rdma_no_bytes_sent: {train_ack[0]}")
                     sync_time = time.perf_counter() - t_sync
                     log.info("RDMA sync acked at step %d (%.1fs)", k, sync_time)
                 except Exception as exc:
-                    sync_mode = "disk"
                     sync_reason = f"rdma_sync_failed: {exc}"
-                    log.warning("Switching to disk weight sync: %s", sync_reason)
-                    await train_engine.save_weights()
-                    await rollout_engine.reload_from_disk(weights_dir)
-                    sync_time = time.perf_counter() - t_sync
-                    log.info("Rollout server reloaded from %s (%.1fs)", weights_dir, sync_time)
+                    raise RuntimeError(sync_reason) from exc
             else:
                 await train_engine.save_weights()
                 await rollout_engine.reload_from_disk(weights_dir)
