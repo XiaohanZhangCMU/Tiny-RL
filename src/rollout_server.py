@@ -34,9 +34,22 @@ def _join_uri(root: str, leaf: str) -> str:
 
 def _resolve_engine_model(engine):
     candidates = [
+        # vLLM V0 / early V1
         ["llm_engine", "model_executor", "driver_worker", "model_runner", "model"],
         ["llm_engine", "model_executor", "driver_worker", "worker", "model_runner", "model"],
+        # vLLM V1 – underscore driver_worker variant
+        ["llm_engine", "model_executor", "_driver_worker", "model_runner", "model"],
+        # vLLM V1 – engine_core paths
+        ["llm_engine", "engine_core", "executor", "driver_worker", "model_runner", "model"],
+        ["llm_engine", "engine_core", "executor", "_driver_worker", "model_runner", "model"],
+        ["llm_engine", "engine_core", "model_executor", "driver_worker", "model_runner", "model"],
+        # Short-circuit paths
         ["engine", "model"],
+        ["llm_engine", "model"],
+        ["llm_engine", "engine_core", "model"],
+        # vLLM V1 – scheduler/model_runner variants
+        ["llm_engine", "engine_core", "scheduler", "model_runner", "model"],
+        ["llm_engine", "model_executor", "driver_worker", "worker_module", "model_runner", "model"],
     ]
     for path in candidates:
         cur = engine
@@ -47,7 +60,79 @@ def _resolve_engine_model(engine):
                 break
             cur = getattr(cur, part)
         if ok and hasattr(cur, "named_parameters"):
+            log.info("_resolve_engine_model: found model via path [%s]", " -> ".join(path))
             return cur
+
+    # vLLM V1 executor with a _workers list (UniProcExecutor / RayExecutor in-proc)
+    for exec_path in [
+        ["llm_engine", "model_executor"],
+        ["llm_engine", "engine_core", "executor"],
+        ["llm_engine", "engine_core", "model_executor"],
+    ]:
+        cur = engine
+        ok = True
+        for part in exec_path:
+            if not hasattr(cur, part):
+                ok = False
+                break
+            cur = getattr(cur, part)
+        if not ok:
+            continue
+        for workers_attr in ("_workers", "workers", "_driver_workers"):
+            wlist = getattr(cur, workers_attr, None)
+            if wlist and len(wlist) > 0:
+                w = wlist[0]
+                for mr_attr in ("model_runner", "worker"):
+                    mr = getattr(w, mr_attr, None)
+                    if mr is None:
+                        continue
+                    m = getattr(mr, "model", None)
+                    if m is not None and hasattr(m, "named_parameters"):
+                        log.info(
+                            "_resolve_engine_model: found via %s.%s[0].%s.model",
+                            ".".join(exec_path), workers_attr, mr_attr,
+                        )
+                        return m
+                # worker itself may be the model_runner
+                m = getattr(w, "model", None)
+                if m is not None and hasattr(m, "named_parameters"):
+                    log.info(
+                        "_resolve_engine_model: found via %s.%s[0].model",
+                        ".".join(exec_path), workers_attr,
+                    )
+                    return m
+
+    # Nothing found – dump two levels of attrs to help diagnose on the next run.
+    log.warning("_resolve_engine_model: all candidates failed; dumping attrs for diagnosis")
+    for top_attr in dir(engine):
+        if top_attr.startswith("__"):
+            continue
+        try:
+            val = getattr(engine, top_attr)
+            log.warning("  engine.%s : %s", top_attr, type(val).__name__)
+        except Exception:
+            pass
+    if hasattr(engine, "llm_engine"):
+        le = engine.llm_engine
+        for attr in dir(le):
+            if attr.startswith("__"):
+                continue
+            try:
+                val = getattr(le, attr)
+                log.warning("  engine.llm_engine.%s : %s", attr, type(val).__name__)
+            except Exception:
+                pass
+        for mid in ("model_executor", "engine_core"):
+            sub = getattr(le, mid, None)
+            if sub is not None:
+                for attr in dir(sub):
+                    if attr.startswith("__"):
+                        continue
+                    try:
+                        val = getattr(sub, attr)
+                        log.warning("  engine.llm_engine.%s.%s : %s", mid, attr, type(val).__name__)
+                    except Exception:
+                        pass
     return None
 
 

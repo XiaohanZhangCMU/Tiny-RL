@@ -145,6 +145,9 @@ class RdmaTrainerBackend:
         tname = server.weight_sync_cfg.get("transport", "mock")
         self.transport = build_transport(tname)
         self.routing_table: list[TransferOp] = []
+        # CPU-pinned staging buffers: ibv_reg_mr works on host pinned memory without GPUDirect RDMA.
+        # Pre-allocated during prepare() and reused across transfer() calls.
+        self._cpu_bufs: dict[str, "torch.Tensor"] = {}
 
     def _prefer_nccl_single_node(self) -> bool:
         # For single 8xH100 (or any single-node setup), keep NCCL baseline.
@@ -208,6 +211,8 @@ class RdmaTrainerBackend:
         if self.server.weight_sync_mode != "rdma":
             return {"status": "ok", "mode": self.server.weight_sync_mode, "reason": self.server.weight_sync_reason}
 
+        import torch
+
         routes: list[dict[str, Any]] = []
         with self.server.summon_full_params(rank0_only=True) as full_params:
             if self.server.rank == 0:
@@ -224,6 +229,9 @@ class RdmaTrainerBackend:
                             "pack": False,
                         }
                     )
+                    # Pre-allocate CPU-pinned staging buffer once; reuse every transfer().
+                    if name not in self._cpu_bufs:
+                        self._cpu_bufs[name] = torch.empty(t.numel(), dtype=t.dtype).pin_memory()
         self.server.dist_barrier()
         if self.server.rank == 0:
             return {"status": "ok", "mode": "rdma", "routes": routes}
@@ -236,13 +244,20 @@ class RdmaTrainerBackend:
         ops = kwargs.get("ops", [])
         res: dict[str, Any] = {"status": "ok", "mode": "rdma", "rank": self.server.rank}
         # All ranks enter summon_full_params (collective all-gather).
-        # Rank 0 builds transfer ops and executes the RDMA transfer while
-        # the full tensors are still alive in GPU memory.
+        # Rank 0 copies GPU params to CPU-pinned staging buffers, then RDMA-writes
+        # from those CPU buffers.  ibv_reg_mr works on pinned host memory without
+        # requiring GPUDirect RDMA (nvidia_peermem), unlike CUDA device pointers.
         with self.server.summon_full_params(rank0_only=True) as full_params:
             if self.server.rank == 0:
+                # Copy GPU → CPU pinned staging buffers (blocking D2H memcpy).
                 param_ptrs: dict[str, int] = {}
                 for name, t in full_params.items():
-                    param_ptrs[name] = int(t.data_ptr())
+                    if name in self._cpu_bufs:
+                        self._cpu_bufs[name].copy_(t.flatten())
+                        param_ptrs[name] = int(self._cpu_bufs[name].data_ptr())
+                    else:
+                        # Fallback to GPU ptr if buffer not pre-allocated.
+                        param_ptrs[name] = int(t.data_ptr())
 
                 parsed_ops: list[TransferOp] = []
                 for op in ops:
@@ -266,17 +281,23 @@ class RdmaTrainerBackend:
                     if p.nbytes > 0 and p.src_ptr > 0 and p.dst_ptr > 0 and p.dst_rkey > 0:
                         parsed_ops.append(p)
 
+                if len(parsed_ops) == 0:
+                    return {
+                        "status": "error",
+                        "mode": "rdma",
+                        "reason": "rdma_no_valid_transfer_ops",
+                    }
                 res = self.transport.transfer(parsed_ops)
+                if res.get("status") == "ok":
+                    if int(res.get("num_ops", 0)) <= 0 or int(res.get("total_bytes", 0)) <= 0:
+                        return {
+                            "status": "error",
+                            "mode": "rdma",
+                            "reason": f"rdma_zero_bytes_sent: {res}",
+                        }
         self.server.dist_barrier()
         if res.get("status") != "ok":
-            disk_res = self.server.save_weights_to_disk()
-            return {
-                "status": "ok",
-                "mode": "rdma",
-                "transport": res,
-                "fallback": "disk",
-                "disk": disk_res,
-            }
+            return {"status": "error", "mode": "rdma", "transport": res}
         return {"status": "ok", "mode": "rdma", "transport": res}
 
 

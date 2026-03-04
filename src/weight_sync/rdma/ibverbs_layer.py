@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno as _errno_mod
 import json
+import logging
 import os
 import random
 import socket
@@ -12,6 +14,8 @@ import time
 from typing import Any
 
 from ..transport import TransferOp, WeightTransferTransport
+
+log = logging.getLogger(__name__)
 
 
 # Access flags from ibv_reg_mr(3)
@@ -298,7 +302,7 @@ class IbverbsTransport(WeightTransferTransport):
         lib_path = ctypes.util.find_library("ibverbs")
         if not lib_path:
             raise RuntimeError("libibverbs not found")
-        self._lib = ctypes.CDLL(lib_path)
+        self._lib = ctypes.CDLL(lib_path, use_errno=True)
 
         self._lib.ibv_get_device_list.argtypes = [ctypes.POINTER(ctypes.c_int)]
         self._lib.ibv_get_device_list.restype = ctypes.POINTER(ctypes.c_void_p)
@@ -583,6 +587,7 @@ class IbverbsTransport(WeightTransferTransport):
                 return x["mr"]
 
         access = IBV_ACCESS_LOCAL_WRITE
+        ctypes.set_errno(0)
         mr = self._lib.ibv_reg_mr(
             self._pd,
             ctypes.c_void_p(ptr),
@@ -590,16 +595,19 @@ class IbverbsTransport(WeightTransferTransport):
             access,
         )
         if not mr:
-            return None
+            err = ctypes.get_errno()
+            return {"status":"error", "reason": f"ibv_reg_mr failed errno={err} ({os.strerror(err)})"}
         self._local_mrs.append({"ptr": ptr, "size": size, "mr": mr})
         return mr
 
     def register_memory_regions(self, regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not self._pd:
+            log.warning("register_memory_regions: protection domain not initialized")
             return []
 
         access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ
         out: list[dict[str, Any]] = []
+        n_failed = 0
         for r in regions:
             size = int(r.get("size", 0))
             ptr = int(r.get("ptr", 0))
@@ -607,6 +615,14 @@ class IbverbsTransport(WeightTransferTransport):
                 continue
             mr = self._lib.ibv_reg_mr(self._pd, ctypes.c_void_p(ptr), ctypes.c_size_t(size), access)
             if not mr:
+                err = ctypes.get_errno()
+                n_failed += 1
+                if n_failed <= 3:
+                    log.warning(
+                        "ibv_reg_mr failed for ptr=0x%x size=%d: errno=%d (%s) "
+                        "– if GPU memory, load nvidia_peermem/nv_peer_mem for GPUDirect RDMA",
+                        ptr, size, err, _errno_mod.errorcode.get(err, "?"),
+                    )
                 continue
             self._local_mrs.append({"ptr": ptr, "size": size, "mr": mr})
             out.append(
@@ -619,6 +635,9 @@ class IbverbsTransport(WeightTransferTransport):
                     "transport": "ibverbs",
                 }
             )
+        if n_failed:
+            log.warning("register_memory_regions: %d/%d ibv_reg_mr calls failed, %d registered",
+                        n_failed, len(regions), len(out))
         return out
 
     def transfer(self, ops: list[TransferOp]) -> dict[str, Any]:
